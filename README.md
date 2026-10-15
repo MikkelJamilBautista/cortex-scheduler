@@ -1,4 +1,4 @@
-# CorTeX v4 — Asynchronous Distributed Task Scheduler
+# Cortex v4 — Asynchronous Distributed Task Scheduler
 
 An autonomous, high-throughput task scheduler for Bitburner written in JavaScript to coordinate distributed jobs across a network of virtual servers with fragmented memory pools. 
 

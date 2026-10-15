@@ -11,27 +11,27 @@ Originally built as an advanced daemon for Bitburner, this scheduler solves real
 ## How It Works
 
 ### 1. Adaptive Dual-Lane Scheduling
-* **Mini-Cycles (< 300 GB RAM):** At lower aggregate memory, traditional schedulers starve waiting for full target preparation. CorTeX dynamically calculates self-recovering mini-HGW cycles that farm money immediately while gradually driving security down to minimums[cite: 2].
-* **Pipelined HWGW (≥ 300 GB RAM):** At higher memory capacities, it switches to pipelined batching (`Hack` → `Weaken 1` → `Grow` → `Weaken 2`) synchronized with 30ms spacing offsets[cite: 2].
-* **Empirical Hand-off:** The 300 GB threshold is derived from empirical A/B simulation benchmarks measuring pool saturation against earnings per second[cite: 2].
+* **Mini-Cycles (< 300 GB RAM):** At lower aggregate memory, traditional schedulers starve waiting for full target preparation. CorTeX dynamically calculates self-recovering mini-HGW cycles that farm money immediately while gradually driving security down to minimums.
+* **Pipelined HWGW (≥ 300 GB RAM):** At higher memory capacities, it switches to pipelined batching (`Hack` → `Weaken 1` → `Grow` → `Weaken 2`) synchronized with 30ms spacing offsets ].
+* **Empirical Hand-off:** The 300 GB threshold is derived from empirical A/B simulation benchmarks measuring pool saturation against earnings per second].
 
 ### 2. Multi-Host Job Placement & Atomic Rollbacks
-* **Combinatorial Allocation:** Dynamically splits and packs multi-threaded jobs across multiple servers when no individual host has enough contiguous free RAM[cite: 2].
-* **Shadow-Pool Validation:** Pre-validates complete job placements against a temporary memory state before execution[cite: 2]. If any job in a batch fails to place, the entire batch rolls back atomically to avoid desyncing target security[cite: 2].
-* **Plan Caching:** Uses an in-memory 128-entry LRU-style Map cache to avoid redundant thread-count recalculations[cite: 2].
+* **Combinatorial Allocation:** Dynamically splits and packs multi-threaded jobs across multiple servers when no individual host has enough contiguous free RAM ].
+* **Shadow-Pool Validation:** Pre-validates complete job placements against a temporary memory state before execution ]. If any job in a batch fails to place, the entire batch rolls back atomically to avoid desyncing target security ].
+* **Plan Caching:** Uses an in-memory 128-entry LRU-style Map cache to avoid redundant thread-count recalculations ].
 
 ### 3. Fault Tolerance & Self-Healing
-* **Process Adoption:** Identifies existing worker processes on startup and adopts their PIDs rather than terminating running tasks[cite: 2].
-* **Error Classification:** Probes failed executions and classifies them by root cause (`nofile`, `noram`, `nogone`) instead of failing silently[cite: 2].
-* **Automatic Script Repair:** Periodically verifies that remote hosts actually have the worker files and automatically re-copies them if they were deleted or lost[cite: 2].
+* **Process Adoption:** Identifies existing worker processes on startup and adopts their PIDs rather than terminating running tasks ].
+* **Error Classification:** Probes failed executions and classifies them by root cause (`nofile`, `noram`, `nogone`) instead of failing silently ].
+* **Automatic Script Repair:** Periodically verifies that remote hosts actually have the worker files and automatically re-copies them if they were deleted or lost ].
 
 ### 4. Robust Throughput Telemetry
-* **Theil-Sen Median Estimator:** Standard rolling averages produce extreme spikes whenever a batch finishes[cite: 2]. CorTeX calculates the median slope of pairwise samples over a 90-second trailing window (120 samples) to provide a stable, accurate read on true income[cite: 2].
-* **Reset Recovery:** Detects large wallet drops caused by game resets or hardware purchases, automatically clearing historical samples and rebuilding the rate cleanly[cite: 2].
+* **Theil-Sen Median Estimator:** Standard rolling averages produce extreme spikes whenever a batch finishes ]. CorTeX calculates the median slope of pairwise samples over a 90-second trailing window (120 samples) to provide a stable, accurate read on true income ].
+* **Reset Recovery:** Detects large wallet drops caused by game resets or hardware purchases, automatically clearing historical samples and rebuilding the rate cleanly ].
 
 ### 5. Cooperative Concurrency & I/O Throttling
-* **Event Loop Yielding:** Injects cooperative `sleep(0)` yields every 16 launches to ensure scheduling loops never lock the single-threaded execution context[cite: 2].
-* **I/O Budgeting:** Caps snapshot file logging to a 400 KB sliding budget window, preventing disk thrashing and frozen logs on long-running instances[cite: 2].
+* **Event Loop Yielding:** Injects cooperative `sleep(0)` yields every 16 launches to ensure scheduling loops never lock the single-threaded execution context ].
+* **I/O Budgeting:** Caps snapshot file logging to a 400 KB sliding budget window, preventing disk thrashing and frozen logs on long-running instances ].
 
 ---
 

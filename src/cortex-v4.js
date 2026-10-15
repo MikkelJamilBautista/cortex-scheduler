@@ -1,5 +1,5 @@
 /** @param {NS} ns */
-
+//cortex-p98(post-98)
 export async function main(ns) {
     ns.disableLog("ALL");
     ns.clearLog();
@@ -14,7 +14,8 @@ export async function main(ns) {
         // behaviour is unchanged) but add a real floor: homes below 64 GB previously
         // reserved half *and* had min(used, hm) clamping the reported usage.
         HOME_RESERVE_GB: 32, HOME_RESERVE_FRACTION: 0.50, HOME_RESERVE_CAP_GB: 256,
-        SPACING: 30, MAX_SPACING: 160, LEAD: 1000,
+        SPACING: 40, MAX_SPACING: 160, SPACING_MIN: 20, SPACING_MAX: 160,
+        ADAPTIVE_SPACING: false, FREEAT_DIAG: true, DRIFT_PORT: 8, LEAD: 1000,
         MAX_BATCHES: 600, YIELD_EVERY: 16,
         MAX_HACK_FRACTION: 0.90,
         MIN_HACK_CHANCE: 0.10,
@@ -165,6 +166,10 @@ export async function main(ns) {
         eventLog.push({ t: time, text: line + "\n" });
         eventsDirty = true;
     };
+    const recordBatchTiming = job => {
+        if (!job.batch || job.spacingSampled) return;
+        job.spacingSampled = true;
+    };
 
     // -- B7: bounded drain instead of an unbounded while --
     const drainPort = () => {
@@ -175,9 +180,17 @@ export async function main(ns) {
         }
         return n;
     };
+    const drainDrift = () => {
+        for (let n = 0; n < C.PORT_MAX_DRAIN; n++) {
+            const v = ns.readPort(C.DRIFT_PORT);
+            if (v === "NULL PORT DATA") break;
+            if (Number.isFinite(Number(v))) spacingSample(ctx, C, Number(v), event);
+        }
+    };
 
     // Startup: adopt own workers, never kill them, and never kill another instance's.
     drainPort();
+    drainDrift();
     event("Cortex V4-beta Core initialized successfully.");
     for (const note of pendingStartupNotes) event(note);
 
@@ -203,6 +216,8 @@ export async function main(ns) {
         const formulas = ns.fileExists("Formulas.exe", "home");
         const servers = scan(ns);
         const pool = [];
+        const hostMax = Object.create(null);
+        const hostReserve = Object.create(null);
 
         // -- B3: liveness-truthful ledger --
         // The old pass kept any entry whose stamp had not aged past LEDGER_GRACE,
@@ -214,6 +229,9 @@ export async function main(ns) {
         let keep = 0;
         for (const j of ctx.ledger) {
             if (j.dead) continue;
+            if (j.batch && !j.spacingSampled && j.host && !ns.isRunning(j.pid, j.host)) {
+                recordBatchTiming(j);
+            }
             if (j.end + C.LEDGER_GRACE <= nowMs) {
                 j.dead = true;
                 j.completedAt = nowMs;
@@ -299,6 +317,7 @@ export async function main(ns) {
 
         // -- B7: the port is telemetry, and it does not measure lateness --
         const late = drainPort();
+        drainDrift();
         lateTotal += late;
         if (late >= 5) {
             lateEvents++;
@@ -374,6 +393,8 @@ export async function main(ns) {
             const reserve = Math.min(C.HOME_RESERVE_CAP_GB,
                 Math.max(C.HOME_RESERVE_GB, raw * C.HOME_RESERVE_FRACTION));
             const hm = host === "home" ? Math.max(0, raw - reserve) : raw;
+            hostMax[host] = raw;
+            hostReserve[host] = (host === "home" ? reserve : 0) + 0.5;
             // Report true usage; the old min(used, hm) clamp could print used > total.
             const used = ns.getServerUsedRam(host);
             const hu = Math.min(used, hm);
@@ -382,6 +403,15 @@ export async function main(ns) {
             if (used > hm) ctx.reserveBreached = true;
             pool.push({ name: host, free: Math.max(0, hm - hu - 0.5), max: hm, home: host === "home" });
         }
+        // Ero98's host-pinned phases motivate this diagnostic; allocation stays unchanged.
+        const freeAt = (host, T) => {
+            let used = 0;
+            for (const j of ctx.ledger) {
+                if (j.host !== host) continue;
+                if (j.start <= T && T < j.end) used += j.ram * j.n;
+            }
+            return Math.max(0, (hostMax[host] - hostReserve[host]) - used);
+        };
 
         // -- Cortex's own landed income --
         // Two independent sources, because they can disagree in the field:
@@ -812,10 +842,25 @@ export async function main(ns) {
                 const chosen = selected.plan;
                 reusePlan = chosen;
 
+                let faN = 0, faSum = 0, faMax = 0, faNeg = 0;
+                if (C.FREEAT_DIAG) {
+                    for (const a of selected.placements) {
+                        const host = pool.find(p => p.name === a.host);
+                        if (!host) continue;
+                        const gain = freeAt(a.host, a.job.land) - host.free;
+                        faN++; faSum += gain; faMax = Math.max(faMax, gain);
+                        if (gain < 0) faNeg++;
+                    }
+                }
                 if (!launchBatch(ns, pool, ctx, t.name, selected.placements)) {
                     saturated = true;
                     batchBlocker = { target: t.name, ...diagnostic, reason: "Placement became stale or worker launch failed." };
                     break;
+                }
+                if (faN) {
+                    ctx.fa ??= { n: 0, sum: 0, max: 0, neg: 0 };
+                    ctx.fa.n += faN; ctx.fa.sum += faSum;
+                    ctx.fa.max = Math.max(ctx.fa.max, faMax); ctx.fa.neg += faNeg;
                 }
 
                 displayPlan = chosen;
@@ -882,10 +927,8 @@ export async function main(ns) {
         const nm = (x, d = 2) => ns.format.number(x, d);
         const rm = x => ns.format.ram(x);
 
-        // Progress bar: a modern 1/8-block tip over a filled/empty track.
-        // Full block  = complete cell, 1/8..7/8 = partial, light shade = empty.
-        // TRACK must not collide with PARTIAL[1]: a 1/8 partial has to stay
-        // distinguishable from a single empty cell.
+        // Progress bar: one-cell eighth-block glyphs over a filled/empty track.
+        // Full block = complete cell, partial blocks = fractions, light shade = empty.
         const PARTIAL = ["", "▏", "▎", "▍", "▌", "▋", "▊", "▉"];
         const TRACK = "░";
         const progBar = (frac, w = 10) => {
@@ -936,7 +979,7 @@ export async function main(ns) {
             const v = visLen(s);
             if (v <= w) return s;
             // Cut on the visible prefix only; callers pass uncoloured text.
-            return s.slice(0, Math.max(0, w - 1)) + "…";
+            return s.slice(0, Math.max(0, w - 1)) + "...";
         };
 
         const W = 88;
@@ -946,12 +989,13 @@ export async function main(ns) {
         const clock = new Date(Date.now());
         const pad2 = n => String(n).padStart(2, "0");
         const stamp = `${pad2(clock.getHours())}:${pad2(clock.getMinutes())}:${pad2(clock.getSeconds())}`;
-        // Boxed panel borders. These are single-width glyphs, so the column
-        // arithmetic (W / IN) is unaffected.
+        // Unicode borders sharpen the fixed-width panel.
+        // Single-cell glyphs preserve the existing column geometry in the game tail.
+        // The in-game font must render each glyph as one cell.
         const DIV = `  ${A.sub}${"─".repeat(W)}${A.reset}`;
-        const TOP = `  ${A.sub}┌${"─".repeat(IN)}┐${A.reset}`;
+        const TOP = `  ${A.sub}╭${"─".repeat(IN)}╮${A.reset}`;
         const MID = `  ${A.sub}├${"─".repeat(IN)}┤${A.reset}`;
-        const BOT = `  ${A.sub}└${"─".repeat(IN)}┘${A.reset}`;
+        const BOT = `  ${A.sub}╰${"─".repeat(IN)}╯${A.reset}`;
         // Compact money for table cells: exact to 3 significant decimals, suffixed.
         const money2 = n => {
             const a = Math.abs(n);
@@ -992,9 +1036,9 @@ export async function main(ns) {
         // --------------------------------
         const earlyActive = partnerMode || (targetMode === "EARLY" && earlyCycleStatuses.length > 0);
         const laneTag = partnerMode
-            ? `${A.cyn}EARLY·MINI${A.reset}`
+            ? `${A.cyn}EARLY.MINI${A.reset}`
             : targetMode === "EARLY"
-                ? `${A.yel}EARLY·SEQ${A.reset}`
+                ? `${A.yel}EARLY.SEQ${A.reset}`
                 : `${A.dim}PIPELINE${A.reset}`;
         const engineTag = formulas ? `${A.grn}FORMULAS${A.reset}` : `${A.yel}HEURISTIC${A.reset}`;
         const phaseStr = batchTargets.length > 0
@@ -1028,12 +1072,12 @@ export async function main(ns) {
             `${A.dim}STATE${A.reset} ${A.dim}wallet${A.reset} ${A.wht}$${shortNum(bank)}${A.reset}` +
             `   ${A.dim}hack${A.reset} ${A.wht}${hackLvl}${A.reset}` +
             `   ${A.dim}ram/t${A.reset} ${A.gry}${SCRIPT_RAM.toFixed(1)}GB${A.reset}` +
-            `   ${A.dim}xp${A.reset} ${ctx.xp ? `${A.cyn}${ctx.xp}${A.reset}` : `${A.sub}—${A.reset}`}` +
+            `   ${A.dim}xp${A.reset} ${ctx.xp ? `${A.cyn}${ctx.xp}${A.reset}` : `${A.sub}-${A.reset}`}` +
             `   ${A.dim}batches${A.reset} ${A.wht}${shortNum(totalBatches)}${A.reset}`
         ));
         logLine(panelRow(padLR(
             `${A.dim}uptime${A.reset} ${A.cyn}${upStr}${A.reset}`,
-            `${A.dim}tick${A.reset} ${A.gry}${tick}${A.reset} ${A.dim}·${A.reset} ${A.gry}${stamp}${A.reset}`,
+            `${A.dim}tick${A.reset} ${A.gry}${tick}${A.reset} ${A.dim}.${A.reset} ${A.gry}${stamp}${A.reset}`,
             IN - 2
         )));
         logLine(BOT);
@@ -1073,7 +1117,7 @@ export async function main(ns) {
             logLine(padLR(
                 `  ${prefix} ${bar} ${splitLabel}  ${cortLabel}  ${otherLabel}`,
                 `${A.dim}lifetime${A.reset} ${A.wht}$${shortNum(lifetime)}${A.reset}` +
-                (ctx.income && ctx.income.resets ? ` ${A.yel}↺${ctx.income.resets} reset${ctx.income.resets > 1 ? "s" : ""}${A.reset}` : ""),
+                (ctx.income && ctx.income.resets ? ` ${A.yel}o${ctx.income.resets} reset${ctx.income.resets > 1 ? "s" : ""}${A.reset}` : ""),
                 W + 2
             ));
         }
@@ -1083,7 +1127,7 @@ export async function main(ns) {
             ctx.augResetSeen = false;
         }
         if (ctx.augResetSeen) {
-            logLine(`  ${A.yel}⟳${A.reset} ${A.dim}income history reset (augment install or node reset) — rate rebuilding${A.reset}`);
+            logLine(`  ${A.yel}!${A.reset} ${A.dim}income history reset (augment install or node reset) - rate rebuilding${A.reset}`);
         }
         // --------------------------------
         // Target table
@@ -1144,7 +1188,7 @@ export async function main(ns) {
             // Vault cell: bar + percent + absolute money, or an idle placeholder.
             const vaultCell = item.active || frac > 0.001
                 ? `${band(frac)}${progBar(frac, 8)}${A.reset} ${band(frac)}${(frac * 100).toFixed(0).padStart(3)}%${A.reset} ${A.gry}${money2(t.curMoney)}${A.reset}`
-                : `${A.sub}${"░".repeat(8)}${A.reset} ${A.sub}idle${A.reset}`;
+                : `${A.sub}${"·".repeat(8)}${A.reset} ${A.sub}idle${A.reset}`;
 
             // Security cell: 3-cell heat bar + signed delta.
             const secFrac = Math.max(0.05, Math.min(1, secDelta / Math.max(1, C.WEAKEN_FIRST_ABOVE)));
@@ -1152,8 +1196,8 @@ export async function main(ns) {
             const secCell = `${secColor}${progBar(secFrac, 3)}${A.reset} ${secColor}${(secDelta >= 0 ? "+" : "")}${secDelta.toFixed(2)}${A.reset}`;
 
             const thrCells = sx.h + sx.g + sx.w > 0
-                ? `${A.gry}${thrFmt(sx.h)}${A.sub}·${A.gry}${thrFmt(sx.g)}${A.sub}·${A.gry}${thrFmt(sx.w)}${A.reset}`
-                : `${A.sub}—${A.reset}`;
+                ? `${A.gry}${thrFmt(sx.h)}${A.sub}/${A.gry}${thrFmt(sx.g)}${A.sub}/${A.gry}${thrFmt(sx.w)}${A.reset}`
+                : `${A.sub}-${A.reset}`;
             // Reserve a fixed 7-cell slot for the trailing activity hint so the
             // THREADS column always starts at the same offset.
             const hintRaw = item.active ? aboutOf(st) : "";
@@ -1221,17 +1265,17 @@ export async function main(ns) {
                     (ctx.recopies > 0 ? `  ${A.grn}repairs${A.reset} ${A.grn}${ctx.recopies}${A.reset}` : "") +
                     (ctx.missingFiles.size > 0 ? `  ${A.red}hosts missing workers: ${ctx.missingFiles.size}${A.reset}` : ""));
             } else if (ctx.recopies > 0) {
-                logLine(`  ${A.dim}failwhy${A.reset} ${A.grn}clean${A.reset} ${A.dim}— worker files repaired on${A.reset} ${A.grn}${ctx.recopies}${A.reset} ${A.dim}host(s) this session${A.reset}`);
+                logLine(`  ${A.dim}failwhy${A.reset} ${A.grn}clean${A.reset} ${A.dim}- worker files repaired on${A.reset} ${A.grn}${ctx.recopies}${A.reset} ${A.dim}host(s) this session${A.reset}`);
             }
         }
         if (saturated || batchBlocker) {
             const blockerTarget = batchBlocker ? batchBlocker.target : null;
             const headroom = batchBlocker ? Math.max(0, batchBlocker.availableGB) : 0;
-            logLine(`  ${A.yel}●${A.reset} ${A.dim}backpressure${A.reset} ` +
+            logLine(`  ${A.yel}◆${A.reset} ${A.dim}backpressure${A.reset} ` +
                 `${A.gry}${blockerTarget ? `${blockerTarget} · ${rm(headroom)} headroom` : "pool saturated"}${A.reset}` +
                 (prepReserveGB > 0 ? `  ${A.dim}prep reserve${A.reset} ${A.gry}${rm(prepReserveGB)}${A.reset}` : ""));
         } else {
-            logLine(`  ${A.grn}○${A.reset} ${A.dim}backpressure${A.reset} ${A.gry}clear — headroom available${A.reset}`);
+            logLine(`  ${A.grn}✓${A.reset} ${A.dim}backpressure${A.reset} ${A.gry}clear - headroom available${A.reset}`);
         }
 
         // --------------------------------
@@ -1268,6 +1312,8 @@ export async function main(ns) {
         fileLine(`BatchMath: WPT=${C.WPT} HACK_SEC=${C.HACK_SEC} GROW_SEC=${C.GROW_SEC}`);
         fileLine(`IncomeRate: source=${ctx.incomeSource || "api"} wallet=$${(ctx.incomeRate || 0).toFixed(2)}/s cortex=$${(ctx.earnedRate || 0).toFixed(2)}/s lifetime=$${(ctx.earned || 0).toFixed(0)} observed=$${(ctx.observedEarned || 0).toFixed(0)} apiHack=$${totalEarned.toFixed(0)} samples=${ctx.income ? ctx.income.samples.length : 0} resets=${ctx.income ? ctx.income.resets : 0}`);
         fileLine(`ExecHealth: calls=${ctx.execs} fails=${ctx.fails} pct=${(ctx.execs ? (ctx.fails / ctx.execs * 100).toFixed(2) : "0")}% nofile=${ctx.failByCause.nofile} noram=${ctx.failByCause.noram} hostgone=${ctx.failByCause.nogone} other=${ctx.failByCause.unknown} recopies=${ctx.recopies} verifyScans=${ctx.verifyScans || 0} cacheTrusted=${ctx.cacheTrustedHits || 0} hostsMissingWorkers=${ctx.missingFiles.size}${ctx.missingFiles.size ? ` [${[...ctx.missingFiles].slice(0, 8).join(",")}]` : ""}`);
+        if (ctx.fa?.n) fileLine(`FreeAtDiag: n=${ctx.fa.n} avgGain=${(ctx.fa.sum/ctx.fa.n).toFixed(2)}GB maxGain=${ctx.fa.max.toFixed(2)}GB neg=${ctx.fa.neg} spacing=${C.SPACING}`);
+        fileLine(`Spacing: pick=${ctx.drift?.pick ?? C.SPACING}`);
         for (const t of targets) {
             const st = state[t.name], sx = statOf(t.name);
             const dx = statOfDisplay(t.name);
@@ -2639,7 +2685,7 @@ function launchBatch(ns, pool, ctx, target, placements) {
         }
         // B3: `end` is an expected-landing stamp only; liveness decides release,
         // and `start` lets the reconcile pass ignore just-launched jobs.
-        entries.push({ pid, host: a.host, start: Date.now(), end: a.job.land + 50, t: target, type: a.job.type, n: a.threads, b: 0, ram: a.job.ram });
+        entries.push({ pid, host: a.host, start: Date.now(), end: a.job.land + 50, t: target, type: a.job.type, n: a.threads, b: 0, ram: a.job.ram, batch: true });
     }
     const first = entries.find(e => e.type === 'h');
     if (first) first.b = 1;
@@ -2691,10 +2737,20 @@ function pruneLog(buffer, retentionMs, maxBytes) {
     while (buffer.length > 1 && bytes > maxBytes) bytes -= buffer.shift().text.length;
 }
 
+function spacingSample(ctx, C, err, event) {
+    const d = ctx.drift ??= { n: 0, sum: 0, max: 0, pick: C.SPACING };
+    d.n++; d.sum += err; d.max = Math.max(d.max, err);
+    if (d.n < 500) return;
+    const avg = d.sum / d.n;
+    if (avg < 15 && d.max < 60) d.pick = Math.max(C.SPACING_MIN, d.pick - 5);
+    else if (avg > 50) d.pick = Math.min(C.SPACING_MAX, d.pick + 5);
+    event(`SPACING: avg ${avg.toFixed(1)}ms max ${d.max.toFixed(0)}ms -> pick ${d.pick}ms (${C.ADAPTIVE_SPACING ? "applied" : "log only"})`);
+    if (C.ADAPTIVE_SPACING) C.SPACING = d.pick;
+    d.n = 0; d.sum = 0; d.max = 0;
+}
+
 function dur(ms) {
     const s = Math.floor(ms / 1000);
     const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60), sec = s % 60;
     return h > 0 ? `${h}h ${String(m).padStart(2, "0")}m` : `${m}m ${String(sec).padStart(2, "0")}s`;
 }
-
-

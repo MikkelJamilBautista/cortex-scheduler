@@ -1,0 +1,662 @@
+/** @param {NS} ns */
+//cortex-v3
+export async function main(ns) {
+    ns.disableLog("ALL");
+    ns.clearLog();
+    ns.ui.openTail();
+    ns.ui.resizeTail(1150, 450);
+
+    const CFG = {
+        TICK_MS: 1000,
+        HOME_RESERVE_RAM: 256,
+        PREP_SEC_EPS: 0.005,
+        PREP_MONEY_FRAC: 0.999,
+        WEAKEN_FIRST_ABOVE: 3.0,
+        SPACING: 40,
+        LEAD_MS: 1000,
+        MAX_BATCHES_PER_TICK: 600,
+        YIELD_EVERY: 16,
+        HACK_PCTS: [0.9, 0.75, 0.5, 0.35, 0.25, 0.15, 0.10, 0.05, 0.025],
+        BATCH_RAM_SHARE: 0.85,
+        PREP_SHARE: 0.35,
+        DRIFT_TICKS: 3,
+        XP_FARM: true,
+        XP_KEEP_FREE: 0.25,
+        LOG_FILE: "/logs/cortex-log-for-debug.txt",
+        EVENT_LOG: "/logs/cortex-events-for-debug.txt",
+        LOG_RETENTION_MS: 60 * 60 * 1000,
+        SNAPSHOT_EVERY_TICKS: 20,
+        SNAPSHOT_MAX_BYTES: 1_200_000,
+        EVENT_MAX_BYTES: 250_000,
+        LEDGER_GRACE_MS: 2000,
+    };
+    CFG.WPT = ns.weakenAnalyze(1);
+
+    const S = CFG.SPACING;
+    const FILES = { h: "h.js", g: "g.js", w: "w.js" };
+    const fileNames = Object.values(FILES);
+    for (const f of fileNames) {
+        if (!ns.fileExists(f, "home")) {
+            ns.tprint(`ERROR: Script ${f} missing on home.`);
+            return;
+        }
+    }
+
+    const R = {
+        h: ns.getScriptRam(FILES.h),
+        g: ns.getScriptRam(FILES.g),
+        w: ns.getScriptRam(FILES.w),
+    };
+    const ctx = { copied: new Set(), uid: Date.now(), execFails: 0, ledger: [], xpTarget: null };
+    const tstate = {};
+    let historyBuffer = [];
+    const events = [];
+    const eventLog = [];
+    let tickNo = 0, totalBatches = 0, driftEvents = 0, lastExecFails = 0, totalLate = 0;
+    let eventsDirty = false;
+    let tickEvents = [];
+    const startTime = Date.now();
+
+    const ev = (msg) => {
+        const line = `[${new Date().toLocaleTimeString()}] ${msg}`;
+        events.push(line);
+        if (events.length > 30) events.shift();
+        tickEvents.push(line);
+        eventLog.push({ t: Date.now(), text: line + "\n" });
+        eventsDirty = true;
+    };
+    const bar = (frac, width = 12) => {
+        const f = Math.max(0, Math.min(1, frac));
+        const n = f >= 0.999 ? width : Math.floor(f * width + 1e-9);
+        return "[" + "■".repeat(n) + "·".repeat(width - n) + "]";
+    };
+    const dur = (ms) => {
+        const seconds = Math.floor(ms / 1000);
+        const hours = Math.floor(seconds / 3600);
+        const minutes = Math.floor((seconds % 3600) / 60);
+        const secs = seconds % 60;
+        return hours > 0
+            ? `${hours}h ${String(minutes).padStart(2, "0")}m`
+            : `${minutes}m ${String(secs).padStart(2, "0")}s`;
+    };
+
+    ev("Cortex v2 tuned: clearing old worker scripts...");
+    for (const host of scanNetwork(ns)) {
+        if (!ns.hasRootAccess(host)) continue;
+        for (const proc of ns.ps(host)) {
+            if (fileNames.includes(proc.filename)) ns.kill(proc.pid);
+        }
+    }
+    while (ns.readPort(7) !== "NULL PORT DATA") { }
+    ev("Network clear. Engine online.");
+
+    while (true) {
+        const tickStart = Date.now();
+        tickNo++;
+        tickEvents = [];
+        ns.clearLog();
+        let currentTickOutput = "";
+        const logLine = (text = "") => {
+            ns.print(text);
+            currentTickOutput += text + "\n";
+        };
+        const fileLine = (text = "") => { currentTickOutput += text + "\n"; };
+        const hasFormulas = ns.fileExists("Formulas.exe", "home");
+
+        const servers = scanNetwork(ns);
+        const pool = [];
+        const nowMs = Date.now();
+        let keep = 0;
+        for (let i = 0; i < ctx.ledger.length; i++) {
+            if (ctx.ledger[i].end + CFG.LEDGER_GRACE_MS > nowMs) {
+                ctx.ledger[keep++] = ctx.ledger[i];
+            }
+        }
+        ctx.ledger.length = keep;
+
+        if (tickNo % 60 === 0) {
+            const live = new Set();
+            for (const host of servers) {
+                for (const proc of ns.ps(host)) live.add(proc.pid);
+            }
+            ctx.ledger = ctx.ledger.filter(job => live.has(job.pid));
+        }
+
+        const stats = {};
+        let totalH = 0, totalG = 0, totalW = 0;
+        for (const job of ctx.ledger) {
+            const st = (stats[job.t] ??= { h: 0, g: 0, w: 0, batches: 0 });
+            st[job.type] += job.n;
+            st.batches += job.b;
+            if (job.type === "h") totalH += job.n;
+            else if (job.type === "g") totalG += job.n;
+            else totalW += job.n;
+        }
+
+        let lateNow = 0;
+        while (ns.readPort(7) !== "NULL PORT DATA") lateNow++;
+        totalLate += lateNow;
+        if (lateNow >= 5) ev(`WARN: ${lateNow}+ operations landed late.`);
+
+        let maxRam = 0, usedRam = 0;
+        for (const host of servers) {
+            if (!ns.hasRootAccess(host)) continue;
+            if (host !== "home" && !ctx.copied.has(host)) {
+                await ns.scp(fileNames, host, "home");
+                ctx.copied.add(host);
+            }
+            const rawMax = ns.getServerMaxRam(host);
+            if (rawMax <= 0) continue;
+            const isHome = host === "home";
+            const hostMax = isHome ? Math.max(0, rawMax - CFG.HOME_RESERVE_RAM) : rawMax;
+            const hostUsed = Math.min(ns.getServerUsedRam(host), hostMax);
+            maxRam += hostMax;
+            usedRam += hostUsed;
+            pool.push({
+                name: host,
+                free: Math.max(0, hostMax - hostUsed - 0.5),
+                max: hostMax,
+                home: isHome,
+            });
+        }
+
+        const statOf = (name) => stats[name] || { h: 0, g: 0, w: 0, batches: 0 };
+        const player = ns.getPlayer();
+        const hackLvl = player.skills.hacking;
+        const targets = [];
+        for (const name of servers) {
+            if (name === "home" || !ns.hasRootAccess(name)) continue;
+            const maxM = ns.getServerMaxMoney(name);
+            if (maxM <= 0) continue;
+            const serverInfo = ns.getServer(name);
+            if (serverInfo.requiredHackingSkill > hackLvl) continue;
+
+            const mock = {
+                ...serverInfo,
+                hackDifficulty: serverInfo.minDifficulty,
+                moneyAvailable: serverInfo.moneyMax,
+            };
+            const wNow = ns.getWeakenTime(name);
+            let wT, gT, hT, chance;
+            if (hasFormulas) {
+                wT = ns.formulas.hacking.weakenTime(mock, player);
+                gT = ns.formulas.hacking.growTime(mock, player);
+                hT = ns.formulas.hacking.hackTime(mock, player);
+                chance = ns.formulas.hacking.hackChance(mock, player);
+            } else {
+                const minSec = serverInfo.minDifficulty;
+                const curSec = serverInfo.hackDifficulty;
+                const req = serverInfo.requiredHackingSkill;
+                const ratio = (2.5 * req * minSec + 500) / (2.5 * req * curSec + 500);
+                const chanceRatio = (100 - minSec) / Math.max(1e-9, 100 - curSec);
+                wT = wNow * ratio;
+                gT = ns.getGrowTime(name) * ratio;
+                hT = ns.getHackTime(name) * ratio;
+                chance = Math.min(1, ns.hackAnalyzeChance(name) * chanceRatio);
+            }
+            targets.push({
+                name,
+                maxM,
+                minSec: serverInfo.minDifficulty,
+                curSec: serverInfo.hackDifficulty,
+                curMoney: serverInfo.moneyAvailable,
+                wT, gT, hT, wNow, chance, mock,
+            });
+        }
+
+        for (const t of targets) {
+            const ref = makePlan(ns, t, 0.10, CFG, R, player, hasFormulas);
+            t.score = ref && ref.ramSec > 0
+                ? (ref.frac * t.maxM * t.chance) / ref.ramSec
+                : 0;
+        }
+        targets.sort((a, b) => b.score - a.score);
+
+        for (const t of targets) {
+            const st = (tstate[t.name] ??= { mode: "prep", bad: 0, nextLand: 0, pct: 0, secTol: 0 });
+            const sx = statOf(t.name);
+            const inflight = sx.h + sx.g + sx.w;
+            const ok = t.curMoney >= t.maxM * CFG.PREP_MONEY_FRAC &&
+                t.curSec <= t.minSec + CFG.PREP_SEC_EPS;
+            const prevMode = st.mode;
+
+            if (st.mode === "prep") {
+                if (ok && sx.h === 0 && sx.g === 0) {
+                    st.mode = "batch";
+                    st.bad = 0;
+                    st.pct = 0;
+                    st.secTol = 0;
+                    st.nextLand = 0;
+                }
+            } else if (st.mode === "batch") {
+                if (inflight === 0) {
+                    st.bad = 0;
+                    if (!ok) st.mode = "prep";
+                } else if (st.pct > 0) {
+                    const healthy = t.curMoney >= t.maxM * (1 - st.pct) * 0.95 &&
+                        t.curSec <= t.minSec + st.secTol;
+                    st.bad = healthy ? 0 : st.bad + 1;
+                    if (st.bad >= CFG.DRIFT_TICKS) {
+                        st.mode = "drain";
+                        driftEvents++;
+                        ev(`DRIFT: ${t.name} unhealthy ${st.bad} ticks; draining.`);
+                    }
+                }
+            } else if (inflight === 0) {
+                st.mode = "prep";
+            }
+            if (st.mode !== prevMode) ev(`${t.name}: ${prevMode.toUpperCase()} -> ${st.mode.toUpperCase()}`);
+        }
+
+        const batchTargets = targets.filter(t => tstate[t.name].mode === "batch");
+        const unprepped = targets.filter(t => tstate[t.name].mode !== "batch");
+        const needPrep = unprepped.some(t => tstate[t.name].mode === "prep");
+        const freeStart = pool.reduce((sum, host) => sum + host.free, 0);
+        let prepLeftGB = batchTargets.length > 0 ? freeStart * CFG.PREP_SHARE : freeStart;
+
+        const prep = (script, ram, threads, target, actionMs) => {
+            if (!Number.isFinite(threads) || threads <= 0) return 0;
+            const count = Math.min(Math.ceil(threads), Math.floor(prepLeftGB / ram));
+            if (count <= 0) return 0;
+            const done = prepDeploy(ns, pool, ctx, script, ram, count, target, actionMs);
+            prepLeftGB -= done * ram;
+            return done;
+        };
+
+        for (const t of unprepped) {
+            if (tstate[t.name].mode !== "prep") continue;
+            const sx = statOf(t.name);
+            const secDiff = Math.max(0, t.curSec - t.minSec);
+            const strayHackSec = sx.h * HACK_SEC;
+            const pendingGrowSec = sx.g * GROW_SEC;
+            if (secDiff > CFG.WEAKEN_FIRST_ABOVE) {
+                const need = Math.ceil((secDiff + strayHackSec + pendingGrowSec) / CFG.WPT);
+                prep(FILES.w, R.w, need - sx.w, t.name, t.wT);
+            } else {
+                let addG = 0;
+                if (t.curMoney < t.maxM * CFG.PREP_MONEY_FRAC) {
+                    const totalG = Math.ceil(ns.growthAnalyze(t.name, t.maxM / Math.max(t.curMoney, 1)));
+                    if (Number.isFinite(totalG)) addG = Math.max(0, totalG - sx.g);
+                }
+                const needW = Math.ceil((secDiff + strayHackSec + (sx.g + addG) * GROW_SEC) / CFG.WPT);
+                prep(FILES.w, R.w, needW - sx.w, t.name, t.wT);
+                prep(FILES.g, R.g, addG, t.name, t.gT);
+            }
+        }
+
+        // Admit complete batches against actual free RAM and actual per-host fit.
+        // No aggregate theoretical footprint is subtracted from the fleet budget.
+        const prepReserveGB = maxRam * (needPrep ? (1 - CFG.BATCH_RAM_SHARE) : 0.05);
+        let freeGB = pool.reduce((sum, host) => sum + host.free, 0);
+        let saturated = false, launchedThisTick = 0, burst = 0;
+        const activePipelines = [];
+
+        for (const t of batchTargets) {
+            const st = tstate[t.name];
+            const sx = statOf(t.name);
+            const depth = Math.max(1, Math.floor(t.wT / (4 * S)));
+            const lead = t.wNow * 1.02 + CFG.LEAD_MS + 2 * S;
+            const horizon = lead + CFG.TICK_MS + 4 * S;
+            const candidates = [];
+            const pctList = st.pct > 0
+                ? [st.pct, ...CFG.HACK_PCTS.filter(p => p < st.pct)]
+                : CFG.HACK_PCTS;
+            for (const pct of pctList) {
+                const plan = makePlan(ns, t, pct, CFG, R, player, hasFormulas);
+                if (plan) candidates.push(plan);
+            }
+
+            let launched = 0;
+            let displayPlan = candidates[0] || null;
+            while (launchedThisTick < CFG.MAX_BATCHES_PER_TICK) {
+                const now = Date.now();
+                const L = Math.max(st.nextLand, now + lead);
+                if (L - now > horizon) break;
+                const availableGB = freeGB - prepReserveGB;
+                let plan = null;
+                let jobs = null;
+
+                for (const candidate of candidates) {
+                    if (candidate.ram > availableGB) continue;
+                    const candidateJobs = [
+                        { type: "h", s: FILES.h, n: candidate.h, ram: R.h, land: L - 3 * S, dur: t.hT },
+                        { type: "w", s: FILES.w, n: candidate.w1, ram: R.w, land: L - 2 * S, dur: t.wT },
+                        { type: "g", s: FILES.g, n: candidate.g, ram: R.g, land: L - S, dur: t.gT },
+                        { type: "w", s: FILES.w, n: candidate.w2, ram: R.w, land: L, dur: t.wT },
+                    ];
+                    if (canFitBatch(pool, candidateJobs)) {
+                        plan = candidate;
+                        jobs = candidateJobs;
+                        break;
+                    }
+                }
+                if (!plan) {
+                    saturated = true;
+                    break;
+                }
+
+                displayPlan = plan;
+                st.pct = sx.batches === 0 && launched === 0
+                    ? plan.pct
+                    : Math.max(st.pct, plan.pct);
+                st.secTol = sx.batches === 0 && launched === 0
+                    ? plan.secTol
+                    : Math.max(st.secTol, plan.secTol);
+
+                if (st.lastPct !== plan.pct) {
+                    ev(`${t.name}: Focus Lock ${(plan.pct * 100).toFixed(1)}% | H:${plan.h} G:${plan.g} W:${plan.w1}+${plan.w2}`);
+                    st.lastPct = plan.pct;
+                }
+                if (!launchBatch(ns, pool, ctx, t.name, jobs)) {
+                    saturated = true;
+                    break;
+                }
+                freeGB -= plan.ram;
+                launched++;
+                launchedThisTick++;
+                st.nextLand = L + 4 * S;
+                if (++burst >= CFG.YIELD_EVERY) {
+                    burst = 0;
+                    await ns.sleep(0);
+                }
+            }
+            if ((sx.batches > 0 || launched > 0) && displayPlan) {
+                activePipelines.push({ t, st, plan: displayPlan, launched, maxBatches: depth });
+            }
+        }
+
+        if (CFG.XP_FARM && hasFormulas) {
+            if (!ctx.xpTarget || tickNo % 60 === 1) ctx.xpTarget = pickXpTarget(ns, servers, player);
+            let budget = Math.max(0, freeGB - maxRam * CFG.XP_KEEP_FREE);
+            if (ctx.xpTarget) {
+                const xpDuration = ns.getWeakenTime(ctx.xpTarget);
+                for (const host of pool.slice().sort((a, b) => b.free - a.free)) {
+                    if (budget < R.w) break;
+                    const n = Math.floor(Math.min(host.free, budget) / R.w);
+                    if (n < 1) continue;
+                    const pid = run(ns, ctx, host.name, FILES.w, n, ctx.xpTarget, 0, xpDuration);
+                    if (pid) {
+                        host.free -= n * R.w;
+                        budget -= n * R.w;
+                        ctx.ledger.push({
+                            pid,
+                            end: Date.now() + xpDuration,
+                            t: "__xp", type: "w", n, b: 0,
+                        });
+                    }
+                }
+            }
+        }
+
+        totalBatches += launchedThisTick;
+        if (ctx.execFails > lastExecFails) {
+            const failSpike = ctx.execFails - lastExecFails;
+            if (failSpike >= 10) ev(`WARN: +${failSpike} exec failures this tick.`);
+            lastExecFails = ctx.execFails;
+        }
+
+        const activeSet = new Set(activePipelines.map(item => item.t.name));
+        const activePrep = unprepped.filter(t => ["drain", "prep"].includes(tstate[t.name].mode));
+        const standby = batchTargets.filter(t => !activeSet.has(t.name));
+        const nm = (x, d = 2) => ns.format.number(x, d);
+        const rm = x => ns.format.ram(x);
+        const divider = "─".repeat(118);
+        const targetRow = (t) => {
+            const st = tstate[t.name];
+            const active = activePipelines.find(item => item.t.name === t.name);
+            const sx = statOf(t.name);
+            const frac = t.maxM > 0 ? t.curMoney / t.maxM : 0;
+            let status = "QUEUED", info = saturated ? "RAM/host fit limit" : "awaiting focus lock";
+            if (active) {
+                status = "FOCUS";
+                info = `pipe ${sx.batches}/${active.maxBatches} @ ${(active.plan.pct * 100).toFixed(0)}%`;
+            } else if (st.mode === "batch") {
+                status = "READY";
+                info = "prepped; idle";
+            } else if (st.mode === "drain") {
+                status = "DRAIN";
+                info = "flushing active threads";
+            } else {
+                status = "PREP";
+                info = t.curSec - t.minSec > CFG.WEAKEN_FIRST_ABOVE
+                    ? "cooling security"
+                    : (t.curMoney < t.maxM * CFG.PREP_MONEY_FRAC ? "growing money" : "finishing weaken");
+            }
+            return ` ${t.name.padEnd(18)} ${status.padEnd(7)} ${bar(frac, 10)} ${(nm(t.curMoney) + "/" + nm(t.maxM)).padEnd(22)} ${(frac * 100).toFixed(0).padStart(3)}% +${Math.max(0, t.curSec - t.minSec).toFixed(2).padEnd(7)} H:${sx.h} G:${sx.g} W:${sx.w} ${(t.wT / 1000).toFixed(1)}s ${info}`;
+        };
+
+        const bank = ns.getServerMoneyAvailable("home");
+        const sumCur = targets.reduce((sum, t) => sum + t.curMoney, 0);
+        const sumMax = targets.reduce((sum, t) => sum + t.maxM, 0);
+        const poolFree = pool.reduce((sum, host) => sum + host.free, 0);
+        const largestBlock = pool.reduce((max, host) => Math.max(max, host.free), 0);
+        const stamp = new Date().toLocaleTimeString();
+        logLine(`┌${divider}┐`);
+        logLine(`│ CORTEX v2 ${hasFormulas ? "Formulas" : "Fallback"} │ ${stamp} │ Up ${dur(Date.now() - startTime)} │ Tick ${tickNo} │ Hacking ${hackLvl}`);
+        logLine(`├${divider}┤`);
+        logLine(`│ CASH $${nm(bank)} │ Income $${nm(ns.getTotalScriptIncome()[0])}/s │ Targets $${nm(sumCur)} / $${nm(sumMax)}`);
+        logLine(`│ RAM ${bar(usedRam / Math.max(1, maxRam), 16)} ${rm(usedRam)} / ${rm(maxRam)} │ Free ${rm(poolFree)} │ Largest host ${rm(largestBlock)}`);
+        logLine(`│ IN-FLIGHT H:${totalH} G:${totalG} W:${totalW} │ Exec fails ${ctx.execFails} │ Late ${totalLate} │ Drift ${driftEvents}`);
+        logLine(`│ PIPELINES ${activePipelines.length} │ +${launchedThisTick} batches/tick, ${totalBatches} total │ XP ${ctx.xpTarget || "-"}`);
+        logLine(`├${divider}┤`);
+        for (const item of activePipelines) logLine(targetRow(item.t));
+        for (const t of activePrep) logLine(targetRow(t));
+        for (const t of standby) logLine(targetRow(t));
+        for (const e of events.slice(-6)) logLine(`│ ${e}`);
+        logLine(`└${divider}┘`);
+
+        fileLine(`\n--- SNAPSHOT tick #${tickNo} @ ${stamp} ---`);
+        fileLine(`RAM free=${poolFree.toFixed(1)}GB batchHeadroom=${Math.max(0, poolFree - prepReserveGB).toFixed(1)}GB saturated=${saturated} prepReserve=${prepReserveGB.toFixed(1)}GB`);
+        fileLine(`Threads H:${totalH} G:${totalG} W:${totalW} ExecFails:${ctx.execFails} Late:${totalLate} XP:${ctx.xpTarget || "-"}`);
+        for (const t of targets) {
+            const st = tstate[t.name];
+            const sx = statOf(t.name);
+            fileLine(`${t.name.padEnd(18)} mode=${st.mode} bad=${st.bad} pct=${st.pct} secTol=${st.secTol.toFixed(2)} money=${Math.round(t.curMoney)}/${Math.round(t.maxM)} sec=${t.curSec.toFixed(3)}/${t.minSec.toFixed(3)} wT=${(t.wT / 1000).toFixed(2)}s wNow=${(t.wNow / 1000).toFixed(2)}s score=${t.score.toExponential(3)} H${sx.h}/G${sx.g}/W${sx.w} batches=${sx.batches} nextLandIn=${Math.round(st.nextLand - Date.now())}ms`);
+        }
+
+        if (tickNo % CFG.SNAPSHOT_EVERY_TICKS === 0 || tickEvents.length > 0) {
+            historyBuffer.push({ t: Date.now(), text: currentTickOutput });
+            pruneLog(historyBuffer, CFG.LOG_RETENTION_MS, CFG.SNAPSHOT_MAX_BYTES);
+            await ns.write(CFG.LOG_FILE, historyBuffer.map(item => item.text).join(""), "w");
+        }
+        if (eventsDirty) {
+            pruneLog(eventLog, CFG.LOG_RETENTION_MS, CFG.EVENT_MAX_BYTES);
+            await ns.write(CFG.EVENT_LOG, eventLog.map(item => item.text).join(""), "w");
+            eventsDirty = false;
+        }
+        await ns.sleep(Math.max(250, CFG.TICK_MS - (Date.now() - tickStart)));
+    }
+}
+
+const HACK_SEC = 0.002;
+const GROW_SEC = 0.004;
+
+function scanNetwork(ns) {
+    const seen = new Set(["home"]);
+    const queue = ["home"];
+    for (let i = 0; i < queue.length; i++) {
+        for (const name of ns.scan(queue[i])) {
+            if (!seen.has(name)) {
+                seen.add(name);
+                queue.push(name);
+            }
+        }
+    }
+    return queue;
+}
+
+function makePlan(ns, t, pct, CFG, R, player, hasFormulas) {
+    const hackPct = hasFormulas
+        ? ns.formulas.hacking.hackPercent(t.mock, player)
+        : ns.hackAnalyze(t.name) * (100 - t.minSec) / Math.max(1e-9, 100 - t.curSec);
+    if (!(hackPct > 0) || !Number.isFinite(hackPct)) return null;
+
+    const h = Math.max(1, Math.floor(pct / hackPct));
+    const frac = Math.min(0.95, hackPct * h);
+    let growThreads;
+    if (hasFormulas) {
+        const afterHack = {
+            ...t.mock,
+            hackDifficulty: t.minSec,
+            moneyAvailable: t.maxM * (1 - frac),
+        };
+        growThreads = ns.formulas.hacking.growThreads(afterHack, player, t.maxM, 1);
+    } else {
+        growThreads = ns.growthAnalyze(t.name, 1 / (1 - frac));
+    }
+    if (!(growThreads > 0) || !Number.isFinite(growThreads)) return null;
+
+    const g = Math.ceil(growThreads);
+    const w1 = Math.max(1, Math.ceil(h * HACK_SEC / CFG.WPT));
+    const w2 = Math.max(1, Math.ceil(g * GROW_SEC / CFG.WPT));
+    const ram = h * R.h + g * R.g + (w1 + w2) * R.w;
+
+    const lead = t.wNow * 1.02 + CFG.LEAD_MS + 2 * CFG.SPACING;
+    const ramSec = (
+        R.h * h * Math.max(0, lead - 3 * CFG.SPACING) +
+        R.w * w1 * Math.max(0, lead - 2 * CFG.SPACING) +
+        R.g * g * Math.max(0, lead - CFG.SPACING) +
+        R.w * w2 * lead
+    ) / 1000;
+    const secTol = Math.max(h * HACK_SEC, g * GROW_SEC) * 1.15 + 0.05;
+    return { pct, frac, h, g, w1, w2, ram, ramSec, secTol };
+}
+
+function makeJobs(plan, t, L, S, FILES, R) {
+    return [
+        { type: "h", s: FILES.h, n: plan.h, ram: R.h, land: L - 3 * S, dur: t.hT },
+        { type: "w", s: FILES.w, n: plan.w1, ram: R.w, land: L - 2 * S, dur: t.wT },
+        { type: "g", s: FILES.g, n: plan.g, ram: R.g, land: L - S, dur: t.gT },
+        { type: "w", s: FILES.w, n: plan.w2, ram: R.w, land: L, dur: t.wT },
+    ];
+}
+
+function canFitBatch(pool, jobs) {
+    const shadow = pool.map(host => ({ ...host }));
+    for (const job of jobs) {
+        if (!allocate(shadow, job.ram, job.n, false)) return false;
+    }
+    return true;
+}
+
+function allocate(pool, ram, n, allowPartial) {
+    const fits = host => Math.floor(host.free / ram + 1e-9);
+    let best = null, bestKey = Infinity;
+    for (const host of pool) {
+        if (fits(host) >= n) {
+            const key = (host.home ? 1e15 : 0) + host.free;
+            if (key < bestKey) {
+                bestKey = key;
+                best = host;
+            }
+        }
+    }
+    if (best) {
+        best.free -= n * ram;
+        return [{ host: best.name, threads: n }];
+    }
+
+    const order = pool.slice().sort((a, b) => (a.home - b.home) || (b.free - a.free));
+    const parts = [];
+    let left = n;
+    for (const host of order) {
+        if (left <= 0) break;
+        const count = Math.min(fits(host), left);
+        if (count <= 0) continue;
+        host.free -= count * ram;
+        parts.push({ host: host.name, threads: count });
+        left -= count;
+    }
+    if (left > 0 && !allowPartial) return null;
+    return parts;
+}
+
+function run(ns, ctx, host, script, threads, target, land, duration) {
+    const pid = ns.exec(script, host, threads, target, Math.round(land), Math.round(duration), ++ctx.uid);
+    if (pid === 0) ctx.execFails++;
+    return pid;
+}
+
+function launchBatch(ns, pool, ctx, target, jobs) {
+    const snapshot = pool.map(host => host.free);
+    const placed = [];
+    for (const job of jobs) {
+        const parts = allocate(pool, job.ram, job.n, false);
+        if (!parts) {
+            pool.forEach((host, i) => { host.free = snapshot[i]; });
+            return false;
+        }
+        for (const part of parts) placed.push({ host: part.host, job, threads: part.threads });
+    }
+
+    const entries = [];
+    for (const item of placed) {
+        const pid = run(ns, ctx, item.host, item.job.s, item.threads, target, item.job.land, item.job.dur);
+        if (!pid) {
+            for (const entry of entries) ns.kill(entry.pid);
+            pool.forEach((host, i) => { host.free = snapshot[i]; });
+            return false;
+        }
+        entries.push({
+            pid,
+            end: item.job.land,
+            t: target,
+            type: item.job.type,
+            n: item.threads,
+            b: 0,
+        });
+    }
+    const firstHack = entries.find(entry => entry.type === "h");
+    if (firstHack) firstHack.b = 1;
+    ctx.ledger.push(...entries);
+    return true;
+}
+
+function prepDeploy(ns, pool, ctx, script, ram, threads, target, duration) {
+    if (!Number.isFinite(threads) || threads <= 0) return 0;
+    let done = 0;
+    for (const part of allocate(pool, ram, Math.ceil(threads), true)) {
+        const actionMs = script === "w.js" ? ns.getWeakenTime(target) : ns.getGrowTime(target);
+        const expectedEnd = Date.now() + actionMs;
+        const pid = run(ns, ctx, part.host, script, part.threads, target, 0, duration);
+        if (pid) {
+            done += part.threads;
+            ctx.ledger.push({
+                pid,
+                end: expectedEnd,
+                t: target,
+                type: script === "w.js" ? "w" : "g",
+                n: part.threads,
+                b: 0,
+            });
+        } else {
+            const host = pool.find(item => item.name === part.host);
+            if (host) host.free += part.threads * ram;
+        }
+    }
+    return done;
+}
+
+function pickXpTarget(ns, servers, player) {
+    let best = null, bestValue = 0;
+    for (const name of servers) {
+        if (name === "home" || !ns.hasRootAccess(name)) continue;
+        const server = ns.getServer(name);
+        if (server.requiredHackingSkill > player.skills.hacking) continue;
+        server.hackDifficulty = server.minDifficulty;
+        const value = ns.formulas.hacking.hackExp(server, player) /
+            ns.formulas.hacking.weakenTime(server, player);
+        if (value > bestValue) {
+            bestValue = value;
+            best = name;
+        }
+    }
+    return best;
+}
+
+function pruneLog(buffer, retentionMs, maxBytes) {
+    const cutoff = Date.now() - retentionMs;
+    while (buffer.length > 0 && buffer[0].t < cutoff) buffer.shift();
+    let bytes = buffer.reduce((sum, item) => sum + item.text.length, 0);
+    while (buffer.length > 1 && bytes > maxBytes) bytes -= buffer.shift().text.length;
+}

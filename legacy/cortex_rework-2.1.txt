@@ -1,0 +1,659 @@
+/** @param {NS} ns */
+export async function main(ns) {
+    ns.disableLog("ALL");
+    ns.clearLog();
+    ns.ui.openTail();
+    ns.ui.resizeTail(1150, 450);
+ 
+    // ============================ CONFIG ============================
+    const CFG = {
+        TICK_MS: 1000,
+        HOME_RESERVE_RAM: 256,
+ 
+        PREP_SEC_EPS: 0.005,
+        PREP_MONEY_FRAC: 0.999,
+        WEAKEN_FIRST_ABOVE: 3.0,
+ 
+        // Focus Fire Batch timing (absolute-landing scripts make small SPACING safe)
+        SPACING: 40,                 // ms between landings; raise to 30-40 if the "Late ops" counter climbs
+        LEAD_MS: 1000,                // safety lead before the first landing; raise if ops start late
+        MAX_BATCHES_PER_TICK: 600,
+        YIELD_EVERY: 16,             // yield to the event loop every N batches launched
+        HACK_PCTS: [0.9, 0.75, 0.5, 0.35, 0.25, 0.15, 0.10, 0.05, 0.025],
+        GROW_PAD: 1.01,
+        BATCH_RAM_SHARE: 0.85,       // steady-state RAM share for batching while prep work exists
+        PREP_SHARE: 0.35,            // max share of free RAM prep may take per tick while batches are running
+        DRIFT_TICKS: 3,
+ 
+        // XP sink for leftover RAM (needs Formulas.exe)
+        XP_FARM: true,
+        XP_KEEP_FREE: 0.25,          // fraction of total RAM never given to XP jobs
+ 
+        // Logging
+        LOG_FILE: "/logs/cortex-log-for-debug.txt",
+        EVENT_LOG: "/logs/cortex-events-for-debug.txt",
+        LOG_RETENTION_MS: 60 * 60 * 1000,
+        SNAPSHOT_EVERY_TICKS: 20,
+        SNAPSHOT_MAX_BYTES: 1_200_000,
+        EVENT_MAX_BYTES: 250_000,
+    };
+    CFG.WPT = ns.weakenAnalyze(1);   // weaken per thread, includes BitNode multipliers
+ 
+    const S = CFG.SPACING;
+    const FILES = { h: "h.js", g: "g.js", w: "w.js" };
+ 
+    for (const f of Object.values(FILES)) {
+        if (!ns.fileExists(f, "home")) {
+            ns.tprint(`ERROR: Script ${f} missing on home.`);
+            return;
+        }
+    }
+ 
+    const R = {
+        h: ns.getScriptRam(FILES.h),
+        g: ns.getScriptRam(FILES.g),
+        w: ns.getScriptRam(FILES.w),
+    };
+    const SCRIPT_RAM = Math.max(R.h, R.g, R.w);
+ 
+    const ctx = { copied: new Set(), uid: Date.now(), execFails: 0, ledger: [], xpTarget: null };
+    const tstate = {};
+    let historyBuffer = [];
+    const eventLog = [];
+    const events = [];
+ 
+    const startTime = Date.now();
+    let tickNo = 0, totalBatches = 0, driftEvents = 0, lastExecFails = 0, totalLate = 0;
+    let eventsDirty = false;
+    let tickEvents = [];
+ 
+    const ev = (msg) => {
+        const line = `[${new Date().toLocaleTimeString()}] ${msg}`;
+        events.push(line);
+        if (events.length > 30) events.shift();
+        tickEvents.push(line);
+        eventLog.push({ t: Date.now(), text: line + "\n" });
+        eventsDirty = true;
+    };
+ 
+    const bar = (frac, w = 12) => {
+        const f = Math.max(0, Math.min(1, frac));
+        const n = f >= 0.999 ? w : Math.floor(f * w + 1e-9);
+        return "[" + "■".repeat(n) + "·".repeat(w - n) + "]";
+    };
+ 
+    const dur = (ms) => {
+        const s = Math.floor(ms / 1000);
+        const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60), sec = s % 60;
+        return h > 0 ? `${h}h ${String(m).padStart(2, "0")}m` : `${m}m ${String(sec).padStart(2, "0")}s`;
+    };
+ 
+    ev("Cortex v2 initialized: Sweeping network for orphaned jobs...");
+    const initServers = scanNetwork(ns);
+    for (const s of initServers) {
+        if (!ns.hasRootAccess(s)) continue;
+        for (const p of ns.ps(s)) {
+            if (Object.values(FILES).includes(p.filename)) ns.kill(p.pid);
+        }
+    }
+    while (ns.readPort(7) !== "NULL PORT DATA") { /* flush stale late-op reports */ }
+    ev("Network clear. Engine online.");
+ 
+    while (true) {
+        const tickStart = Date.now();
+        tickNo++;
+        tickEvents = [];
+        ns.clearLog();
+ 
+        let currentTickOutput = "";
+        const logLine = (text = "") => { ns.print(text); currentTickOutput += text + "\n"; };
+        const fileLine = (text = "") => { currentTickOutput += text + "\n"; };
+ 
+        const hasFormulas = ns.fileExists("Formulas.exe", "home");
+ 
+        // 1. GLOBAL RAM & PID LEDGER AGGREGATION
+        const servers = scanNetwork(ns);
+        const pool = [];
+ 
+        // Expire finished jobs by end time (no per-job NS calls)
+        const nowMs = Date.now();
+        let keep = 0;
+        for (let i = 0; i < ctx.ledger.length; i++) {
+            if (ctx.ledger[i].end + 300 > nowMs) ctx.ledger[keep++] = ctx.ledger[i];
+        }
+        ctx.ledger.length = keep;
+ 
+        // Once a minute, reconcile against reality (catches killed/crashed scripts)
+        if (tickNo % 60 === 0) {
+            const live = new Set();
+            for (const s of servers) for (const p of ns.ps(s)) live.add(p.pid);
+            ctx.ledger = ctx.ledger.filter(j => live.has(j.pid));
+        }
+ 
+        const stats = {};
+        let totalH = 0, totalG = 0, totalW = 0;
+        for (const j of ctx.ledger) {
+            const st = (stats[j.t] ??= { h: 0, g: 0, w: 0, batches: 0 });
+            st[j.type] += j.n;
+            st.batches += j.b;
+            if (j.type === 'h') totalH += j.n;
+            else if (j.type === 'g') totalG += j.n;
+            else totalW += j.n;
+        }
+ 
+        // Late-op reports from the scripts (port 7, capped by port size)
+        let lateNow = 0;
+        while (ns.readPort(7) !== "NULL PORT DATA") lateNow++;
+        totalLate += lateNow;
+        if (lateNow >= 5) ev(`WARN: ${lateNow}+ ops started late - raise LEAD_MS or SPACING`);
+ 
+        let maxRam = 0, usedRam = 0;
+        for (const s of servers) {
+            if (!ns.hasRootAccess(s)) continue;
+ 
+            if (s !== "home" && !ctx.copied.has(s)) {
+                await ns.scp(Object.values(FILES), s, "home");
+                ctx.copied.add(s);
+            }
+ 
+            const rawMax = ns.getServerMaxRam(s);
+            if (rawMax <= 0) continue;
+ 
+            const isHome = s === "home";
+            const sMax = isHome ? Math.max(0, rawMax - CFG.HOME_RESERVE_RAM) : rawMax;
+            const sUsed = Math.min(ns.getServerUsedRam(s), sMax);
+            maxRam += sMax;
+            usedRam += sUsed;
+ 
+            const safeFree = Math.max(0, sMax - sUsed - 0.5);
+            pool.push({ name: s, free: safeFree, max: sMax, home: isHome });
+        }
+ 
+        const statOf = (n) => stats[n] || { h: 0, g: 0, w: 0, batches: 0 };
+        const totalMaxThreads = Math.floor(maxRam / SCRIPT_RAM);
+        const totalActiveThreads = totalH + totalG + totalW;
+        const threadUsagePct = totalMaxThreads > 0 ? (totalActiveThreads / totalMaxThreads) * 100 : 0;
+        const ramLoad = maxRam > 0 ? (usedRam / maxRam) * 100 : 0;
+ 
+        let income = 0;
+        try { income = ns.getTotalScriptIncome()[0]; } catch { income = 0; }
+ 
+        // 2. TARGET SELECTION (score = $ per GB*second, not $ per second)
+        const player = ns.getPlayer();
+        const hackLvl = player.skills.hacking;
+        const targets = [];
+        let unrooted = 0;
+ 
+        for (const s of servers) {
+            if (s === "home") continue;
+            if (!ns.hasRootAccess(s)) {
+                if (ns.getServerMaxMoney(s) > 0) unrooted++;
+                continue;
+            }
+            const maxM = ns.getServerMaxMoney(s);
+            if (maxM <= 0) continue;
+ 
+            const serverInfo = ns.getServer(s);
+            if (serverInfo.requiredHackingSkill > hackLvl / 2) continue;
+ 
+            const mock = { ...serverInfo, hackDifficulty: serverInfo.minDifficulty, moneyAvailable: serverInfo.moneyMax };
+            const wNow = ns.getWeakenTime(s);   // REAL time at current security (used for launch lead)
+            let wT, gT, hT, hackChance;
+ 
+            if (hasFormulas) {
+                wT = ns.formulas.hacking.weakenTime(mock, player);
+                gT = ns.formulas.hacking.growTime(mock, player);
+                hT = ns.formulas.hacking.hackTime(mock, player);
+                hackChance = ns.formulas.hacking.hackChance(mock, player);
+            } else {
+                const minSec = serverInfo.minDifficulty;
+                const curSec = serverInfo.hackDifficulty;
+                const req = serverInfo.requiredHackingSkill;
+                const ratio = (2.5 * req * minSec + 500) / (2.5 * req * curSec + 500);
+                wT = wNow * ratio;
+                gT = ns.getGrowTime(s) * ratio;
+                hT = ns.getHackTime(s) * ratio;
+                hackChance = ns.hackAnalyzeChance(s);
+            }
+ 
+            targets.push({
+                name: s, maxM, minSec: serverInfo.minDifficulty, curSec: serverInfo.hackDifficulty,
+                curMoney: serverInfo.moneyAvailable,
+                wT, gT, hT, wNow, chance: hackChance, mock, score: 0,
+                serverInfo
+            });
+        }
+        for (const t of targets) {
+            const ref = makePlan(ns, t, 0.10, CFG, R, player, hasFormulas);
+            t.score = ref ? (ref.frac * t.maxM * t.chance) / ref.ramSec : 0;
+        }
+        targets.sort((a, b) => b.score - a.score);
+ 
+        // 3. TARGET STATE MACHINE
+        for (const t of targets) {
+            const st = (tstate[t.name] ??= { mode: "prep", bad: 0, nextLand: 0, pct: 0, secTol: 0 });
+            const sx = statOf(t.name);
+            const inflight = sx.h + sx.g + sx.w;
+            const ok = t.curMoney >= t.maxM * CFG.PREP_MONEY_FRAC && t.curSec <= t.minSec + CFG.PREP_SEC_EPS;
+            const prevMode = st.mode;
+ 
+            if (st.mode === "prep") {
+                if (ok && sx.h === 0 && sx.g === 0) {
+                    st.mode = "batch";
+                    st.bad = 0; st.pct = 0; st.secTol = 0; st.nextLand = 0;
+                }
+            } else if (st.mode === "batch") {
+                if (inflight === 0) {
+                    st.bad = 0;
+                    if (!ok) st.mode = "prep";
+                } else if (st.pct > 0) {
+                    const healthy = t.curMoney >= t.maxM * (1 - st.pct) * 0.95 && t.curSec <= t.minSec + st.secTol;
+                    st.bad = healthy ? 0 : st.bad + 1;
+                    if (st.bad >= CFG.DRIFT_TICKS) {
+                        st.mode = "drain";
+                        driftEvents++;
+                        ev(`DRIFT: ${t.name} unhealthy ${st.bad} ticks | money ${(100 * t.curMoney / t.maxM).toFixed(1)}% sec +${(t.curSec - t.minSec).toFixed(2)} (tol ${st.secTol.toFixed(2)}). Draining.`);
+                    }
+                }
+            } else {
+                if (inflight === 0) st.mode = "prep";
+            }
+ 
+            if (st.mode !== prevMode) {
+                ev(`${t.name}: ${prevMode.toUpperCase()} -> ${st.mode.toUpperCase()}`);
+            }
+        }
+ 
+        // 4a. PREP FIRST (so batching can never starve it), capped to a share of free RAM while batches run
+        const batchTargets = targets.filter(t => tstate[t.name].mode === "batch");
+        const unprepped = targets.filter(t => tstate[t.name].mode !== "batch");
+        const needPrep = unprepped.some(t => tstate[t.name].mode === "prep");
+ 
+        const freeStart = pool.reduce((a, p) => a + p.free, 0);
+        let prepLeftGB = batchTargets.length > 0 ? freeStart * CFG.PREP_SHARE : freeStart;
+        const prep = (script, ram, threads, target) => {
+            if (!Number.isFinite(threads) || threads <= 0) return 0;
+            const n = Math.min(Math.ceil(threads), Math.floor(prepLeftGB / ram));
+            if (n <= 0) return 0;
+            const done = prepDeploy(ns, pool, ctx, script, ram, n, target);
+            prepLeftGB -= done * ram;
+            return done;
+        };
+ 
+        for (const t of unprepped) {
+            if (tstate[t.name].mode !== "prep") continue;
+ 
+            const sx = statOf(t.name);
+            const secDiff = Math.max(0, t.curSec - t.minSec);
+            const strayHackSec = sx.h * HACK_SEC;
+            const pendingGrowSec = sx.g * GROW_SEC;
+ 
+            if (secDiff > CFG.WEAKEN_FIRST_ABOVE) {
+                const need = Math.ceil((secDiff + strayHackSec + pendingGrowSec) / CFG.WPT);
+                prep(FILES.w, R.w, need - sx.w, t.name);
+            } else {
+                let addG = 0;
+                if (t.curMoney < t.maxM * CFG.PREP_MONEY_FRAC) {
+                    const totalG = Math.ceil(ns.growthAnalyze(t.name, t.maxM / Math.max(t.curMoney, 1)));
+                    if (Number.isFinite(totalG)) addG = Math.max(0, totalG - sx.g);
+                }
+                const needW = Math.ceil((secDiff + strayHackSec + (sx.g + addG) * GROW_SEC) / CFG.WPT);
+                prep(FILES.w, R.w, needW - sx.w, t.name);
+                prep(FILES.g, R.g, addG, t.name);
+            }
+        }
+ 
+        // 4b. FOCUS FIRE PIPELINE (just-in-time, all-or-nothing, pool-based)
+        const prepReserveGB = needPrep ? maxRam * (1 - CFG.BATCH_RAM_SHARE) : 0;
+        let freeGB = pool.reduce((a, p) => a + p.free, 0);
+        let capGB = maxRam * (needPrep ? CFG.BATCH_RAM_SHARE : 0.95);   // steady-state sizing budget
+        let saturated = false, launchedThisTick = 0, burst = 0;
+        const activePipelines = [];
+ 
+        for (const t of batchTargets) {
+            if (capGB <= 0) { saturated = true; break; }
+ 
+            const st = tstate[t.name];
+            const sx = statOf(t.name);
+            const depth = Math.max(1, Math.floor(t.wT / (4 * S)));
+ 
+            let pick = null, smallest = null;
+            for (const pct of CFG.HACK_PCTS) {
+                const p = makePlan(ns, t, pct, CFG, R, player, hasFormulas);
+                if (!p) continue;
+                smallest = p;
+                if (p.avgRam * depth <= capGB) { pick = p; break; }
+            }
+            pick ??= smallest;
+            if (!pick) continue;
+ 
+            st.pct = sx.batches === 0 ? pick.pct : Math.max(st.pct, pick.pct);
+            const plan = st.pct === pick.pct ? pick : makePlan(ns, t, st.pct, CFG, R, player, hasFormulas);
+            if (!plan) continue;
+            st.secTol = sx.batches === 0 ? plan.secTol : Math.max(st.secTol, plan.secTol);
+            capGB -= plan.avgRam * depth;      // reserve this target's steady-state footprint
+ 
+            if (st.lastPct !== plan.pct) {
+                ev(`${t.name}: Focus Lock ${(plan.pct * 100).toFixed(1)}% | H:${plan.h} G:${plan.g} W:${plan.w1}+${plan.w2}`);
+                st.lastPct = plan.pct;
+            }
+ 
+            // W1 is the longest op to land, so lead is sized from the REAL current weaken time
+            const lead = t.wNow * 1.02 + CFG.LEAD_MS + 2 * S;
+            const horizon = lead + CFG.TICK_MS + 4 * S;
+            let launched = 0;
+ 
+            while (launchedThisTick < CFG.MAX_BATCHES_PER_TICK) {
+                const now = Date.now();
+                const L = Math.max(st.nextLand, now + lead);       // L = W2 landing time
+                if (L - now > horizon) break;                      // too far ahead: scripts would idle holding RAM
+                if (freeGB - prepReserveGB < plan.ram) { saturated = true; break; }
+ 
+                const jobs = [
+                    { type: 'h', s: FILES.h, n: plan.h,  ram: R.h, land: L - 3 * S },
+                    { type: 'w', s: FILES.w, n: plan.w1, ram: R.w, land: L - 2 * S },
+                    { type: 'g', s: FILES.g, n: plan.g,  ram: R.g, land: L - S },
+                    { type: 'w', s: FILES.w, n: plan.w2, ram: R.w, land: L },
+                ];
+                if (!launchBatch(ns, pool, ctx, t.name, jobs)) { saturated = true; break; }
+ 
+                freeGB -= plan.ram;
+                launched++;
+                launchedThisTick++;
+                st.nextLand = L + 4 * S;
+                if (++burst >= CFG.YIELD_EVERY) { burst = 0; await ns.sleep(0); }
+            }
+ 
+            if (sx.batches > 0 || launched > 0) {
+                activePipelines.push({ t, st, plan, launched, maxBatches: depth });
+            }
+        }
+ 
+        // 5. XP SINK: leftover RAM -> weaken on the best exp/time server (weaken at min sec still pays XP)
+        if (CFG.XP_FARM && hasFormulas) {
+            if (!ctx.xpTarget || tickNo % 60 === 1) ctx.xpTarget = pickXpTarget(ns, servers, player);
+            let budget = Math.max(0, freeGB - maxRam * CFG.XP_KEEP_FREE);
+            if (ctx.xpTarget) {
+                for (const p of pool.slice().sort((a, b) => b.free - a.free)) {
+                    if (budget < R.w) break;
+                    const n = Math.floor(Math.min(p.free, budget) / R.w);
+                    if (n < 1) continue;
+                    const pid = run(ns, ctx, p.name, FILES.w, n, ctx.xpTarget, 0);
+                    if (pid) {
+                        p.free -= n * R.w;
+                        budget -= n * R.w;
+                        ctx.ledger.push({ pid, end: Date.now() + ns.getWeakenTime(ctx.xpTarget) + 500, t: "__xp", type: 'w', n, b: 0 });
+                    }
+                }
+            }
+        }
+ 
+        // 6. RENDER HUD
+        totalBatches += launchedThisTick;
+        if (ctx.execFails > lastExecFails) {
+            const failSpike = ctx.execFails - lastExecFails;
+            // Only spam the audit log if we get a massive spike of fails at once
+            if (failSpike >= 10) { 
+                ev(`WARN: +${failSpike} exec fails in one tick! (Total: ${ctx.execFails})`);
+            }
+            lastExecFails = ctx.execFails;
+        }
+ 
+        const activeTargetsSet = new Set(activePipelines.map(l => l.t.name));
+        const activePrep = unprepped.filter(t => tstate[t.name].mode === "drain" || tstate[t.name].mode === "prep");
+        const standbyList = batchTargets.filter(t => !activeTargetsSet.has(t.name));
+ 
+        const nm = (x, d = 2) => ns.format.number(x, d);
+        const rm = (x) => ns.format.ram(x);
+        const DIVIDER = "─".repeat(118);
+ 
+        const formatTargetRow = (t) => {
+            const st = tstate[t.name];
+            const L = activePipelines.find(p => p.t.name === t.name);
+            const sx = statOf(t.name);
+            const frac = t.maxM > 0 ? t.curMoney / t.maxM : 0;
+ 
+            let status = "QUEUED";
+            let info = saturated ? "RAM limit reached" : "awaiting focus lock";
+ 
+            if (L) {
+                status = "FOCUS";
+                const pipelineFill = `${sx.batches}/${L.maxBatches}`;
+                info = `pipe ${pipelineFill.padEnd(9)} @ ${(L.plan.pct * 100).toFixed(0)}%${st.bad > 0 ? ` [drift ${st.bad}]` : ""}`;
+            } else if (st.mode === "batch") {
+                status = "READY";
+                info = "prepped; idle";
+            } else if (st.mode === "drain") {
+                status = "DRAIN";
+                info = "flushing active threads";
+            } else if (st.mode === "prep") {
+                status = "PREP";
+                const secD = t.curSec - t.minSec;
+                info = secD > CFG.WEAKEN_FIRST_ABOVE ? "cooling sec" : (t.curMoney < t.maxM * CFG.PREP_MONEY_FRAC ? "growing cash" : "finishing weaken");
+            }
+ 
+            const nameStr = t.name.padEnd(18);
+            const statusStr = status.padEnd(7);
+            const moneyBar = `${bar(frac, 10)} ${(nm(t.curMoney) + "/" + nm(t.maxM)).padEnd(16)} ${(frac * 100).toFixed(0).padStart(3)}%`;
+            const secStr = `+${Math.max(0, t.curSec - t.minSec).toFixed(2)} (${t.minSec.toFixed(0)})`.padEnd(12);
+            const thrStr = `H:${String(sx.h).padEnd(4)} G:${String(sx.g).padEnd(4)} W:${String(sx.w).padEnd(4)}`;
+            const wkStr = `${(t.wT / 1000).toFixed(1)}s`.padStart(6);
+ 
+            return ` ${nameStr} ${statusStr} ${moneyBar}  ${secStr}  ${thrStr}  ${wkStr}  ${info}`;
+        };
+ 
+        const bank = ns.getServerMoneyAvailable("home");
+        const sumCur = targets.reduce((a, t) => a + t.curMoney, 0);
+        const sumMax = targets.reduce((a, t) => a + t.maxM, 0);
+        const poolFree = pool.reduce((a, p) => a + p.free, 0);
+        const biggest = pool.reduce((a, p) => Math.max(a, p.free), 0);
+        const timestamp = new Date().toLocaleTimeString();
+        const modeLabel = hasFormulas ? "Formulas Mode" : "Standard Fallback Mode";
+ 
+        logLine(`┌${DIVIDER}┐`);
+        logLine(`│ CORTEX v2 (${modeLabel}) │ ${timestamp} │ Up: ${dur(Date.now() - startTime).padEnd(8)} │ Tick #${String(tickNo).padEnd(5)} │ Hacking Lvl: ${hackLvl}`);
+        logLine(`├${DIVIDER}┤`);
+        logLine(`│  FINANCES  │ Cash: $${nm(bank).padEnd(8)} │ Flow: $${nm(income)}/s (~$${nm(income * 3600)}/hr) │ Total Target Pool: $${nm(sumCur)} / $${nm(sumMax)} (${sumMax > 0 ? (sumCur / sumMax * 100).toFixed(1) : 0}%)`);
+        logLine(`│  MEMORY    │ ${bar(ramLoad / 100, 16)} ${rm(usedRam)} / ${rm(maxRam)} (${ramLoad.toFixed(1)}%) │ Free: ${rm(poolFree)} │ Max Block: ${rm(biggest)}`);
+        logLine(`│  FLEET     │ Threads: ${totalActiveThreads} / ${totalMaxThreads} (${threadUsagePct.toFixed(1)}%) │ In-flight: H:${totalH} | G:${totalG} | W:${totalW} │ ExecFails: ${ctx.execFails} │ Late ops: ${totalLate}`);
+        logLine(`│  PIPELINE  │ Active Targets: ${activePipelines.length} │ Batches: +${launchedThisTick} tick / ${totalBatches} total │ XP target: ${ctx.xpTarget ?? "-"}`);
+        logLine(`├${DIVIDER}┤`);
+        logLine(`  TARGET             MODE    MONEY STACK                       SECURITY      ACTIVE THREADS       WEAKEN  DETAILS`);
+        logLine(`  ${"─".repeat(18)} ─────── ${"─".repeat(31)}  ${"─".repeat(12)}  ${"─".repeat(18)}  ──────  ${"─".repeat(20)}`);
+ 
+        if (activePipelines.length > 0) {
+            logLine(`  -- [ ACTIVE PIPELINES ] --`);
+            for (const item of activePipelines) logLine(formatTargetRow(item.t));
+        }
+ 
+        if (activePrep.length > 0) {
+            logLine(`  -- [ PREPARATION & DRAINING ] --`);
+            for (const t of activePrep) logLine(formatTargetRow(t));
+        }
+ 
+        if (standbyList.length > 0) {
+            logLine(`  -- [ STANDBY (PREPPED) ] --`);
+            for (const t of standbyList) logLine(formatTargetRow(t));
+        }
+ 
+        logLine(`├${DIVIDER}┤`);
+        logLine(`│ RECENT EVENTS & DRIFT AUDIT`);
+        const recent = events.slice(-6);
+        if (recent.length === 0) logLine(`│   (no recent warnings or state transitions)`);
+        else for (const e of recent) logLine(`│   ${e}`);
+        logLine(`└${DIVIDER}┘`);
+ 
+        fileLine(`\n--- SNAPSHOT tick #${tickNo} @ ${timestamp} ---`);
+        fileLine(`RAM: Free ${poolFree.toFixed(1)}GB | SteadyCap left ${capGB.toFixed(1)}GB | Saturated: ${saturated} | PrepReserve ${prepReserveGB.toFixed(1)}GB`);
+        fileLine(`Active Threads: H:${totalH} G:${totalG} W:${totalW} | ExecFails: ${ctx.execFails} | Late ops: ${totalLate} | XP target: ${ctx.xpTarget ?? "-"}`);
+        for (const t of targets) {
+            const st = tstate[t.name];
+            const sx = statOf(t.name);
+            fileLine(`  ${t.name.padEnd(18)} mode=${st.mode} bad=${st.bad} pct=${st.pct} secTol=${st.secTol.toFixed(2)} money=${Math.round(t.curMoney)}/${Math.round(t.maxM)} sec=${t.curSec.toFixed(3)}/${t.minSec.toFixed(3)} wT=${(t.wT / 1000).toFixed(2)}s wNow=${(t.wNow / 1000).toFixed(2)}s score=${t.score.toExponential(3)} inflight=H${sx.h}/G${sx.g}/W${sx.w} batches=${sx.batches} nextLandIn=${Math.round(st.nextLand - Date.now())}ms`);
+        }
+ 
+        const wantSnapshot = tickNo % CFG.SNAPSHOT_EVERY_TICKS === 0 || tickEvents.length > 0;
+        if (wantSnapshot) {
+            historyBuffer.push({ t: Date.now(), text: currentTickOutput });
+            pruneLog(historyBuffer, CFG.LOG_RETENTION_MS, CFG.SNAPSHOT_MAX_BYTES);
+            await ns.write(CFG.LOG_FILE, historyBuffer.map(e => e.text).join(""), "w");
+        }
+ 
+        if (eventsDirty) {
+            pruneLog(eventLog, CFG.LOG_RETENTION_MS, CFG.EVENT_MAX_BYTES);
+            await ns.write(CFG.EVENT_LOG, eventLog.map(e => e.text).join(""), "w");
+            eventsDirty = false;
+        }
+ 
+        await ns.sleep(Math.max(250, CFG.TICK_MS - (Date.now() - tickStart)));
+    }
+}
+ 
+// ====================================================================
+// SYSTEM LOGIC & HELPERS
+// ====================================================================
+ 
+const HACK_SEC = 0.002, GROW_SEC = 0.004;   // fixed by the game; never capped by server state
+ 
+function scanNetwork(ns) {
+    const seen = new Set(["home"]);
+    const queue = ["home"];
+    for (let i = 0; i < queue.length; i++) {
+        for (const n of ns.scan(queue[i])) {
+            if (!seen.has(n)) { seen.add(n); queue.push(n); }
+        }
+    }
+    return queue;
+}
+ 
+function makePlan(ns, t, pct, CFG, R, player, hasFormulas) {
+    const hackPct = hasFormulas
+        ? ns.formulas.hacking.hackPercent(t.mock, player)
+        : ns.hackAnalyze(t.name) * (100 - t.minSec) / (100 - t.curSec);
+    if (!(hackPct > 0)) return null;
+ 
+    const h = Math.max(1, Math.floor(pct / hackPct));
+    const frac = Math.min(0.95, hackPct * h);
+ 
+    let g;
+    if (hasFormulas) {
+        const after = { ...t.mock, moneyAvailable: t.maxM * (1 - frac) };
+        g = ns.formulas.hacking.growThreads(after, player, t.maxM, 1);
+    } else {
+        g = ns.growthAnalyze(t.name, 1 / (1 - frac));
+    }
+    g = Math.ceil(g * CFG.GROW_PAD) + 1;
+    if (!Number.isFinite(g)) return null;
+ 
+    const w1 = Math.max(1, Math.ceil(h * HACK_SEC / CFG.WPT));
+    const w2 = Math.max(1, Math.ceil(g * GROW_SEC / CFG.WPT));
+ 
+    const ram = h * R.h + g * R.g + (w1 + w2) * R.w;
+    const ramSec = (R.w * (w1 + w2) * t.wT + R.g * g * t.gT + R.h * h * t.hT) / 1000;   // GB*s per batch
+    const avgRam = (ramSec * 1000) / t.wT;                                               // steady-state GB per in-flight batch
+    const secTol = Math.max(h * HACK_SEC, g * GROW_SEC) * 1.15 + 0.05;                   // worst legit mid-batch dip
+    return { pct, frac, h, g, w1, w2, ram, ramSec, avgRam, secTol };
+}
+ 
+// Allocate n threads (ram each) across the pool. Mutates pool[].free.
+// Whole job on one host if possible (best-fit, home last); otherwise split largest-first.
+function allocate(pool, ram, n, allowPartial) {
+    const fits = (p) => Math.floor(p.free / ram + 1e-9);
+ 
+    let best = null, bestKey = Infinity;
+    for (const p of pool) {
+        if (fits(p) >= n) {
+            const key = (p.home ? 1e15 : 0) + p.free;
+            if (key < bestKey) { bestKey = key; best = p; }
+        }
+    }
+    if (best) {
+        best.free -= n * ram;
+        return [{ host: best.name, threads: n }];
+    }
+ 
+    const order = pool.slice().sort((a, b) => (a.home - b.home) || (b.free - a.free));
+    const parts = [];
+    let left = n;
+    for (const p of order) {
+        if (left <= 0) break;
+        const cap = fits(p);
+        if (cap <= 0) continue;
+        const take = Math.min(cap, left);
+        p.free -= take * ram;
+        parts.push({ host: p.name, threads: take });
+        left -= take;
+    }
+    if (left > 0 && !allowPartial) return null;
+    return parts;
+}
+ 
+function run(ns, ctx, host, script, threads, target, land) {
+    const pid = ns.exec(script, host, threads, target, Math.round(land), ++ctx.uid);
+    if (pid === 0) ctx.execFails++;
+    return pid;
+}
+ 
+// A batch launches only if ALL four jobs fit; partial batches desync the target.
+function launchBatch(ns, pool, ctx, target, jobs) {
+    const snap = pool.map(p => p.free);
+    const placed = [];
+    for (const j of jobs) {
+        const parts = allocate(pool, j.ram, j.n, false);
+        if (!parts) { pool.forEach((p, i) => { p.free = snap[i]; }); return false; }
+        for (const p of parts) placed.push({ host: p.host, j, threads: p.threads });
+    }
+    const entries = [];
+    for (const a of placed) {
+        const pid = run(ns, ctx, a.host, a.j.s, a.threads, target, a.j.land);
+        if (!pid) {
+            for (const e of entries) ns.kill(e.pid);
+            pool.forEach((p, i) => { p.free = snap[i]; });
+            return false;
+        }
+        entries.push({ pid, end: a.j.land + 50, t: target, type: a.j.type, n: a.threads, b: 0 });
+    }
+    const first = entries.find(e => e.type === 'h');
+    if (first) first.b = 1;               // one counter per BATCH, not per split
+    for (const e of entries) ctx.ledger.push(e);
+    return true;
+}
+ 
+// Prep jobs may be partial; the next tick tops up whatever was missed.
+function prepDeploy(ns, pool, ctx, script, ram, threads, target) {
+    if (!Number.isFinite(threads) || threads <= 0) return 0;
+    const type = script === "w.js" ? "w" : "g";
+    const dur = type === "w" ? ns.getWeakenTime(target) : ns.getGrowTime(target);
+    let done = 0;
+    for (const p of allocate(pool, ram, Math.ceil(threads), true)) {
+        const pid = run(ns, ctx, p.host, script, p.threads, target, 0);   // land=0 -> run immediately
+        if (pid) {
+            done += p.threads;
+            ctx.ledger.push({ pid, end: Date.now() + dur + 500, t: target, type, n: p.threads, b: 0 });
+        }
+    }
+    return done;
+}
+ 
+function pickXpTarget(ns, servers, player) {
+    let best = null, bestV = 0;
+    for (const s of servers) {
+        if (s === "home" || !ns.hasRootAccess(s)) continue;
+        const sv = ns.getServer(s);
+        if (sv.requiredHackingSkill > player.skills.hacking) continue;
+        sv.hackDifficulty = sv.minDifficulty;
+        const v = ns.formulas.hacking.hackExp(sv, player) / ns.formulas.hacking.weakenTime(sv, player);
+        if (v > bestV) { bestV = v; best = s; }
+    }
+    return best;
+}
+ 
+function pruneLog(buf, retentionMs, maxBytes) {
+    const cutoff = Date.now() - retentionMs;
+    while (buf.length > 0 && buf[0].t < cutoff) buf.shift();
+ 
+    let bytes = buf.reduce((sum, item) => sum + item.text.length, 0);
+    while (buf.length > 1 && bytes > maxBytes) {
+        bytes -= buf.shift().text.length;
+    }
+}
